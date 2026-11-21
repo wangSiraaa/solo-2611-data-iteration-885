@@ -213,10 +213,18 @@ class SourceService:
             # fixed version to bind to and the first productive batch is 1.
             row = conn.execute("SELECT COUNT(*) AS n FROM versions").fetchone()
             if row["n"] == 0:
+                import uuid
                 conn.execute(
                     "INSERT INTO versions(version_id, created_at, row_count, "
                     "note) VALUES (0, ?, 0, ?)", (time.time(),
                                                   "initial empty version"))
+                # Immutable archive identity: version numbers restart at 1 in
+                # every database, so (source_id, version) is the globally
+                # unique frozen-version reference used by packing documents.
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('source_id', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (uuid.uuid4().hex,))
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -228,6 +236,19 @@ class SourceService:
     def _ensure(self):
         if not self._initialised:
             self.init()
+
+    def source_id(self) -> str:
+        """Immutable archive identity generated when the database was created."""
+        self._ensure()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='source_id'").fetchone()
+            if row is None:  # pragma: no cover - init always writes it
+                raise SourceError("database predates source_id support")
+            return str(row["value"])
+        finally:
+            conn.close()
 
     # -- batch application ----------------------------------------------
     def apply_batch(self, ops: Sequence[dict], note: Optional[str] = None

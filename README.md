@@ -143,6 +143,64 @@ O(1) 的 float 快路，只在极近时回退 Decimal 与大整数幂。`cut` �
 `hash_hex`，并做一次同版本全量重建比对身份、顺序与真实正文。因此**每行都从源
 API 回查验证**，而不是只写抽样元数据。
 
+## 离线分箱：装箱清单、分阶段验收与每日排车
+
+母库把一个冻结源版装入离线箱后，箱可能迟到、乱序、重复到达。三个新模块只依赖
+标准库，且与上面的抽样合同共用同一套**精确**比较器：
+
+- `wrsource/packing.py`：逐版本装箱清单（manifest）与封箱明细（seal）。
+- `wrsource/acceptance.py`：分阶段验收器、快速单/全收单签发与自包含证书。
+- `wrsource/dispatch.py`：每天一辆车的加急票排车与装运后逐票签发。
+
+### 身份与摘要
+
+每个源库在 `init` 时生成不可变 `source_id`（写入 `meta`）。版本号在每个库里都
+从 1 重新计数，因此清单与封箱的全局身份是 `(source_id, source_version, seed,
+box_id)`。**旧箱不能混入新版**：即便同名箱的行数与最佳键完全相同，封箱里的
+`source_id`/版本号与清单不一致就会被纯函数 `verify_seal` 拒绝，无需联网。
+
+清单对每只箱记录：每组行数、该箱每组**最佳候选的完整精确排序键**
+（`row_id`、`weight`、`hash_hex`、大整数 `a`，含同分破同的 `row_id`），以及对
+这些声明取 SHA-256 的内容摘要；清单本身也有 `manifest_digest`。清单不含正文。
+
+封箱明细含该箱每一行的版本行号 `rev`、`weight`、`body_sha256` 与真实正文。
+`verify_seal` 完全在读者侧运行：逐行按 `(seed, row_id)` 重新抽签、核对正文
+摘要、重算每组冠军键与内容摘要。每只箱可独立、乱序、幂等到达；重复提交同一封箱
+返回 `idempotent`，与已验箱冲突的第二份封箱被保留为异常，不动原证据。
+
+### 快速单与全收单（`acceptance.py`）
+
+`Acceptor` 只信任一份清单，维护已验箱、异常箱与签发台账：
+
+- **快速单 `FAST`**：当已到箱里获选的每一行都有正文，且每个未到箱在清单中的
+  最佳键经精确比较都**严格落后于最后一名获选行**时即可签发；边界检查逐条写入
+  证书 `boundary.checks`。若活跃行少于名额，则必须等该组所有非空箱到齐——清单
+  的 `group_row_count` 此时才能证明没有遗漏的活跃行。
+- **全收单 `FULL`**：必须等该组所有非空箱验过才签发。
+- **名额 0**：立即签发空证书，不等待任何正文。
+
+所有排序都走 `sampling.compare_rank` 的精确三级比较，从不以浮点展示值推断边界。
+签发即冻结：证书嵌入获选行正文、边界证据与所依赖封箱的 `seal_digest`
+（`frozen_boxes`）。之后到达的异常箱只进异常列表，已签证书不变；
+`recheck_certificate` 仅凭证书自身即可离线复查，`recheck_certificate_against_manifest`
+再额外把证书钉到一份清单上。一个冻结版可被许多读者各自建 `Acceptor` 复用，名额
+互不影响；读者带走证书后不能、也不需要再向中心补查。
+
+### 每日一车（`dispatch.py`）
+
+每张加急票绑定同一冻结版，对一个或多个非空组各取冠军一条，整票全或无。
+`plan_dispatch` 从清单取每组冠军的完整键与所属箱，在票子集上做**精确枚举**
+（常规约十张票、数百只未到箱，2^10 量级毫无压力），在车容硬约束下最大化票值；
+同箱只计一次体积，已到馆的箱不占车容，车不必装满，并列最优全部返回。出发前即产出
+保证兑现的票清单与装车单；箱先到馆时按新的已到集合重排。`execute_plan` 在装运
+完成后逐箱验收、对每张票涉及的组做快速签发，缺任一封箱则相关票明确失败而不是
+静默打折。
+
+`demo/run_packing_demo.py` 用真实行复现题面全部数值：零种子均权 E>B>A 下
+甲(B)先到快速签发 B、全收等待；另一源版乙新增 E 后甲先到不能签、到齐签 E，两版
+正文相同而跨版同名箱被拒；排车 X/Y/Z 场景 11（X+Y）→ 13（X+Z）→ 箱先到馆 20，
+以及只做物理移箱（不产生新版本）就让装车从 X+Y 变成 Y+Z。
+
 ## 代码结构
 
 ```
@@ -150,13 +208,20 @@ wrsource/
   sampling.py   精确键、比较器、top-quota、边界证书（无 I/O）
   source.py     版本化源服务 + 分页 + CLI（可独立运行）
   dataset.py    全量构建 / 增量刷新 / 校验 + CLI（可独立运行）
+  packing.py    装箱清单、封箱明细、纯函数校验 + CLI（可独立运行）
+  acceptance.py 分阶段验收器、快速/全收单、冻结证书与离线复查
+  dispatch.py   每日一车的加急票排车、到馆重排、装运后签发
   reference.py  测试用独立精确参考实现
 tests/
   test_sampling.py  键构造、双向一致性、极近键、边界证书、参考对照
   test_source.py    原子批次、折叠、修订号、分片移动、分页并发、重启
   test_dataset.py   全量/参考对照、零/超名额、正文版本、分片不变性、
                     并行一致、撤回首名补位、改组、增量==全量、篡改检测、重开
-demo/run_demo.py    端到端演示（含 --large 10 万行）
+  test_packing.py   清单/封箱、跨版同名箱拒绝、幂等与异常保留、
+                    快速/全收单叙事、名额0与欠名额、冻结证书离线复查、
+                    数百箱多读者、排车 11/13/20、并列、到馆重排、移箱改单
+demo/run_demo.py            端到端演示（含 --large 10 万行）
+demo/run_packing_demo.py    分箱验收与排车端到端演示
 ```
 
 ## 运行
@@ -168,6 +233,9 @@ python3 -m unittest discover -s tests -v
 # 演示（小规模 / 10 万行）
 python3 demo/run_demo.py
 python3 demo/run_demo.py --large --parallel
+
+# 分箱验收与排车演示
+python3 demo/run_packing_demo.py
 
 # 源服务 CLI
 python3 -m wrsource.source init --db src.sqlite
@@ -186,6 +254,13 @@ python3 -m wrsource.dataset refresh --db src.sqlite --old ds_v1 \
     --new-version 2 --out ds_v2
 python3 -m wrsource.dataset verify --db src.sqlite --dataset ds_v2
 python3 -m wrsource.dataset compare --a ds_v2 --b ds_v2_full
+
+# 分箱 CLI（清单 / 封箱 / 纯本地校验，篡改时退出码非 0）
+python3 -m wrsource.packing manifest --db src.sqlite --version 1 \
+        --seed-hex <64 hex> --out manifest.json
+python3 -m wrsource.packing seal --db src.sqlite --manifest manifest.json \
+        --box box-jia --out seal_jia.json
+python3 -m wrsource.packing verify --manifest manifest.json --seal seal_jia.json
 ```
 
 规模验证：10 万行、100 组、每组 quota 1000（合计 10 万样本）时，写入约 2s，
